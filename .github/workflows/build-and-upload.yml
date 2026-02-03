@@ -1,0 +1,234 @@
+name: Build and Upload to Nexus
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g., v3.3.3)'
+        required: false
+        type: string
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        arch: [x86_64, arm64]
+        include:
+          - arch: x86_64
+            platform: linux_x86_64
+            docker_platform: linux/amd64
+          - arch: arm64
+            platform: linux_aarch64
+            docker_platform: linux/arm64
+    runs-on: [self-hosted, droneops]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.ref }}
+          clean: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build wheel setuptools
+
+      - name: Read version
+        id: version
+        run: |
+          # Extract version from dscamera/version.py
+          VERSION=$(python -c "import sys; sys.path.insert(0, 'dscamera'); from version import __version__; print(__version__)")
+
+          # Sanitize version for artifact names (replace invalid characters with dash)
+          # Invalid chars: " : < > | * ? \r \n \ /
+          SANITIZED_VERSION=$(echo "$VERSION" | sed 's/[\/:"<>|*?\\\r\n]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "sanitized_version=${SANITIZED_VERSION}" >> $GITHUB_OUTPUT
+          echo "Building version: ${VERSION} (sanitized: ${SANITIZED_VERSION}) for ${{ matrix.arch }}"
+
+      - name: Set up QEMU for cross-compilation (arm64)
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build wheel for ${{ matrix.arch }}
+        env:
+          PLAT: ${{ matrix.platform }}
+        run: |
+          if [ "${{ matrix.arch }}" == "x86_64" ]; then
+            python -m build --wheel --outdir dist/
+          else
+            docker run --rm \
+              --platform ${{ matrix.docker_platform }} \
+              --user "$(id -u):$(id -g)" \
+              -e HOME=/tmp \
+              -v "$PWD:/workspace" \
+              -w /workspace \
+              python:3.11-slim \
+              /bin/bash -c "
+                pip install --upgrade pip build wheel setuptools && \
+                python -m build --wheel --outdir dist/
+              "
+          fi
+
+
+      - name: List built artifacts
+        run: |
+          ls -lh dist/ || echo "No artifacts found"
+
+      - name: Clean up build artifacts
+        if: always()
+        run: |
+          # Remove build directories that might cause permission issues
+          find . -type d -name "build" -exec rm -rf {} + 2>/dev/null || true
+          find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
+          find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+          find . -type d -name "bdist.*" -exec rm -rf {} + 2>/dev/null || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.arch }}-${{ steps.version.outputs.sanitized_version }}
+          path: dist/*.whl
+          retention-days: 7
+          if-no-files-found: error
+
+  upload:
+    needs: build
+    runs-on: [self-hosted, droneops]
+    if: success()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.ref }}
+          clean: true
+
+      - name: Read version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [ "${{ github.event_name }}" == "pull_request" ]; then
+            # For PRs, use PR number and branch name
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
+            VERSION="pr-${PR_NUMBER}-${BRANCH_NAME}"
+          elif [ -n "${{ github.ref }}" ] && [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            # Extract version from dscamera/version.py
+            VERSION=$(python -c "import sys; sys.path.insert(0, 'dscamera'); from version import __version__; print(__version__)")
+          fi
+
+          # Sanitize version for artifact names (replace invalid characters with dash)
+          # Invalid chars: " : < > | * ? \r \n \ /
+          SANITIZED_VERSION=$(echo "$VERSION" | sed 's/[\/:"<>|*?\\\r\n]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "sanitized_version=${SANITIZED_VERSION}" >> $GITHUB_OUTPUT
+          echo "Uploading version: ${VERSION} (sanitized: ${SANITIZED_VERSION})"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Upload to Nexus
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+          NEXUS_REPOSITORY: ${{ secrets.NEXUS_REPOSITORY || 'raw' }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SANITIZED_VERSION="${{ steps.version.outputs.sanitized_version }}"
+
+          # Find all wheel files recursively
+          find dist/ -name "*.whl" -type f | while read -r wheel; do
+            if [ -f "$wheel" ]; then
+              filename=$(basename "$wheel")
+
+              # Determine architecture from artifact directory or filename
+              if [[ "$wheel" == *"x86_64"* ]]; then
+                arch="x86_64"
+              elif [[ "$wheel" == *"arm64"* ]]; then
+                arch="arm64"
+              elif [[ "$filename" == *"x86_64"* ]] || [[ "$filename" == *"amd64"* ]] || [[ "$filename" == *"linux_x86_64"* ]] || [[ "$filename" == *"manylinux"*"x86_64"* ]]; then
+                arch="x86_64"
+              elif [[ "$filename" == *"aarch64"* ]] || [[ "$filename" == *"arm64"* ]] || [[ "$filename" == *"linux_aarch64"* ]] || [[ "$filename" == *"manylinux"*"aarch64"* ]]; then
+                arch="arm64"
+              elif [[ "$filename" == *"none-any"* ]] || [[ "$filename" == *"py3-none"* ]]; then
+                # Universal wheel - use the architecture from the artifact directory
+                if [[ "$wheel" == *"wheel-x86_64"* ]]; then
+                  arch="x86_64"
+                elif [[ "$wheel" == *"wheel-arm64"* ]]; then
+                  arch="arm64"
+                else
+                  echo "Warning: Could not determine architecture for universal wheel $filename, skipping"
+                  continue
+                fi
+              else
+                echo "Warning: Could not determine architecture for $filename, skipping"
+                continue
+              fi
+
+              # Construct Nexus path
+              # Use sanitized version for paths to avoid URL issues
+              # For PRs, use a different path structure
+              if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+                # Format: {repository}/dscamera/pr/{version}/{arch}/{filename}
+                nexus_path="${NEXUS_REPOSITORY}/dscamera/pr/${SANITIZED_VERSION}/${arch}/${filename}"
+              else
+                # Format: {repository}/dscamera/{version}/{arch}/{filename}
+                nexus_path="${NEXUS_REPOSITORY}/dscamera/${SANITIZED_VERSION}/${arch}/${filename}"
+              fi
+
+              # Ensure NEXUS_URL doesn't have trailing slash
+              NEXUS_BASE_URL="${NEXUS_URL%/}"
+
+              # Construct full URL
+              FULL_URL="${NEXUS_BASE_URL}/${nexus_path}"
+
+              echo "Uploading $filename (arch: $arch) to Nexus..."
+              echo "Source: $wheel"
+              echo "Destination: ${FULL_URL}"
+
+              # Upload to Nexus raw repository using PUT method
+              # Nexus raw repositories typically use PUT for uploads
+              HTTP_CODE=$(curl -k -s -w "%{http_code}" -o /tmp/curl_output \
+                -X PUT \
+                -u "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary "@${wheel}" \
+                "${FULL_URL}")
+
+              if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                echo "Successfully uploaded $filename (HTTP $HTTP_CODE)"
+              else
+                echo "Failed to upload $filename (HTTP $HTTP_CODE)"
+                cat /tmp/curl_output
+                exit 1
+              fi
+
+              echo "Successfully uploaded $filename"
+            fi
+          done
+
+          echo "All wheels uploaded successfully!"
