@@ -14,7 +14,7 @@ setup(
     name="dscamera",
     version=__version__,  # This comes from the exec() above
     license="MIT License",
-    install_requires=["numpy", "opencv-python"],
+    install_requires=["numpy", "opencv-contrib-python"],
     description="Python library for Double Sphere Camera Model",
     long_description=long_description,
     long_description_content_type="text/markdown",
